@@ -79,6 +79,7 @@ type clientVersion struct {
 type whatsmeowService struct {
 	instanceRepository instance_repository.InstanceRepository
 	authDB             *sql.DB
+	authStore          *authStoreHolder
 	messageRepository  message_repository.MessageRepository
 	labelRepository    label_repository.LabelRepository
 	pollService        poll_service.PollService // NOVO: Serviço de enquetes
@@ -97,6 +98,14 @@ type whatsmeowService struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
+}
+
+// authStoreHolder keeps a single shared sqlstore.Container accessible from value
+// receivers (whatsmeowService methods copy the struct; maps/pointers are shared).
+type authStoreHolder struct {
+	once      sync.Once
+	container *sqlstore.Container
+	err       error
 }
 
 type MyClient struct {
@@ -301,6 +310,61 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// getAuthContainer returns a process-wide shared whatsmeow sqlstore.Container.
+//
+// Previously StartClient called sqlstore.New() on every connect/reconnect/QR attempt,
+// which opens a brand-new *sql.DB pool each time. Failed or abandoned starts never
+// closed those pools, so idle Postgres connections accumulated until max_connections
+// (see https://github.com/evolution-foundation/evolution-go/issues/112).
+//
+// NewWithDB reuses the already-pooled authDB/sqliteDB so reconnects do not leak.
+func (w whatsmeowService) getAuthContainer() (*sqlstore.Container, error) {
+	if w.authStore == nil {
+		return nil, fmt.Errorf("auth store holder is not initialized")
+	}
+
+	w.authStore.once.Do(func() {
+		var log waLog.Logger
+		if w.config.WaDebug != "" {
+			log = waLog.Stdout("Database", w.config.WaDebug, true)
+		}
+
+		ctx := context.Background()
+		if w.config.PostgresAuthDB != "" {
+			if w.authDB == nil {
+				w.authStore.err = fmt.Errorf("postgres auth DB is not initialized")
+				return
+			}
+			container := sqlstore.NewWithDB(w.authDB, "postgres", log)
+			if err := container.Upgrade(ctx); err != nil {
+				w.authStore.err = fmt.Errorf("failed to upgrade postgres auth store: %w", err)
+				return
+			}
+			w.authStore.container = container
+			return
+		}
+
+		if w.sqliteDB == nil {
+			w.authStore.err = fmt.Errorf("sqlite auth DB is not initialized")
+			return
+		}
+		container := sqlstore.NewWithDB(w.sqliteDB, "sqlite", log)
+		if err := container.Upgrade(ctx); err != nil {
+			w.authStore.err = fmt.Errorf("failed to upgrade sqlite auth store: %w", err)
+			return
+		}
+		w.authStore.container = container
+	})
+
+	if w.authStore.err != nil {
+		return nil, w.authStore.err
+	}
+	if w.authStore.container == nil {
+		return nil, fmt.Errorf("auth store container is not available")
+	}
+	return w.authStore.container, nil
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
@@ -308,31 +372,20 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	var deviceStore *store.Device
 	var err error
 
-	if w.clientPointer[cd.Instance.Id] != nil {
-		if w.clientPointer[cd.Instance.Id].IsConnected() {
+	if existing := w.clientPointer[cd.Instance.Id]; existing != nil {
+		if existing.IsConnected() {
 			return
 		}
+		// Stale disconnected client left in the map: tear it down before reuse.
+		existing.Disconnect()
+		if mycli, ok := w.myClientPointer[cd.Instance.Id]; ok && mycli.eventHandlerID != 0 {
+			existing.RemoveEventHandler(mycli.eventHandlerID)
+		}
+		delete(w.clientPointer, cd.Instance.Id)
+		delete(w.myClientPointer, cd.Instance.Id)
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
-
+	container, err := w.getAuthContainer()
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
 		return
@@ -2813,6 +2866,7 @@ func NewWhatsmeowService(
 	return &whatsmeowService{
 		instanceRepository: instanceRepository,
 		authDB:             authDB,
+		authStore:          &authStoreHolder{},
 		messageRepository:  messageRepository,
 		labelRepository:    labelRepository,
 		pollService:        pollSvc, // NOVO: Serviço de enquetes

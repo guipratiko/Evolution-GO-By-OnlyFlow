@@ -311,11 +311,12 @@ func initPostgresAuthDB(config *config.Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("erro ao conectar ao banco AUTH PostgreSQL: %v", err)
 	}
 
-	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	db.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	db.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
-	db.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
-	db.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
+	// Shared auth store for all WhatsApp instances (see getAuthContainer / issue #112).
+	// Sized for many concurrent sessions without opening a new pool per StartClient.
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(1 * time.Minute)
 
 	err = db.Ping()
 	if err != nil {
