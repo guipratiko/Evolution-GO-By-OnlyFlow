@@ -1,0 +1,24 @@
+# Evolution GO needs CGO + libwebp for github.com/chai2010/webp.
+# Without these, Nixpacks builds fail with:
+#   undefined: webpDecodeRGB / webpEncodeRGB / ...
+#
+# Prefer the repo Dockerfile in EasyPanel when possible (apk: libwebp-dev).
+# This file makes Nixpacks builds work as a fallback.
+
+[phases.setup]
+aptPkgs = [
+  "build-essential",
+  "pkg-config",
+  "libwebp-dev",
+  "libjpeg-dev",
+]
+
+[variables]
+CGO_ENABLED = "1"
+NIXPACKS_GO_BUILD_FLAGS = "-ldflags=-s"
+
+[phases.build]
+cmds = ["go build -o out ./cmd/evolution-go"]
+
+[start]
+cmd = "./out"

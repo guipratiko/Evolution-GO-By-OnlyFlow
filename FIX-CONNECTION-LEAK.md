@@ -25,6 +25,10 @@ before creating a new one (avoids orphaned sockets / handlers).
 
 ## Deploy
 
-Rebuild the Docker image from this folder and replace the running Evolution GO
-container. After deploy, Postgres `auth` connections should stay near a few per
-instance (shared pool), not grow unboundedly on QR/reconnect.
+1. Point EasyPanel at commit containing this fix (`fix: reuse shared sqlstore...`), not only `sync: 0.7.2`.
+2. Prefer **Dockerfile** build (Alpine + `libwebp-dev` + `CGO_ENABLED=1`).
+3. If EasyPanel uses **Nixpacks**, `nixpacks.toml` installs `libwebp-dev` / build-essential so `github.com/chai2010/webp` links correctly.
+
+Without libwebp, the build fails with `undefined: webpDecodeRGB` / `webpEncodeRGB`.
+
+After deploy, restart/redeploy Evolution GO. Postgres `auth` connections should stay near the shared pool size and stop climbing on QR/reconnect.
