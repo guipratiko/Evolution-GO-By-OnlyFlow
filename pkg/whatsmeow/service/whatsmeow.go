@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/webp"
@@ -68,6 +69,10 @@ type WhatsmeowService interface {
 	PasskeyCeremonyStore() *ceremony.Store
 	SubmitPasskeyResponse(instanceId string, resp *types.WebAuthnResponse) error
 	ConfirmPasskey(instanceId string) error
+
+	// Session health / zombie recovery
+	SessionRecovery() *sessionRecoveryTracker
+	MarkSessionHealthy(instanceId string)
 }
 
 type clientVersion struct {
@@ -98,6 +103,7 @@ type whatsmeowService struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
+	sessionRecovery    *sessionRecoveryTracker
 }
 
 // authStoreHolder keeps a single shared sqlstore.Container accessible from value
@@ -139,6 +145,16 @@ type MyClient struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
 	passkeyCeremony    *ceremony.Store
+
+	// Session health (zombie / half-open WebSocket detection)
+	lastEventAt        atomic.Int64
+	keepAliveFailing   atomic.Bool
+	keepAliveFailSince atomic.Int64
+	connectedSince     atomic.Int64
+	watchdogStarted    atomic.Bool
+	watchdogStop       chan struct{}
+	watchdogStopOnce   sync.Once
+	skipKillRestart    atomic.Bool
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -187,18 +203,21 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	if client, exists := w.clientPointer[instanceId]; exists {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Disconnecting existing client", instanceId)
 
-		// Desconectar o cliente WebSocket
-		if client.IsConnected() {
-			client.Disconnect()
-			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
-		}
-
-		// Remover event handler se existir
+		// Remover event handler / watchdog antes de desconectar
 		if mycli, ok := w.myClientPointer[instanceId]; ok {
+			// ReconnectClient owns the restart via StartInstance — kill loop must only exit.
+			mycli.skipKillRestart.Store(true)
+			mycli.stopSessionWatchdog()
 			if mycli.eventHandlerID != 0 {
 				client.RemoveEventHandler(mycli.eventHandlerID)
 				w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Event handler removed", instanceId)
 			}
+		}
+
+		// Desconectar o cliente WebSocket
+		if client.IsConnected() {
+			client.Disconnect()
+			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
 		}
 	}
 
@@ -548,7 +567,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		loggerWrapper:      w.loggerWrapper,
 		qrcodeCount:        0,
 		passkeyCeremony:    w.passkeyCeremony,
+		watchdogStop:       make(chan struct{}),
 	}
+	mycli.touchLastEvent()
 
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
@@ -629,6 +650,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		select {
 		case <-w.killChannel[cd.Instance.Id]:
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
+			mycli.stopSessionWatchdog()
 			client.Disconnect()
 
 			delete(w.clientPointer, cd.Instance.Id)
@@ -643,6 +665,12 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
 			if err != nil {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
+			}
+
+			// ReconnectClient already restarts via StartInstance — only tear down here.
+			if mycli.skipKillRestart.Load() {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill signal handled without restart (reconnect in progress)", cd.Instance.Id)
+				return
 			}
 
 			postMap := make(map[string]interface{})
@@ -908,6 +936,7 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	userID := mycli.userID
+	mycli.touchLastEvent()
 	postMap := make(map[string]interface{})
 	postMap["data"] = rawEvt
 	doWebhook := false
@@ -1007,6 +1036,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			if err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 			}
+
+			mycli.markKeepAliveFailing(false)
+			mycli.connectedSince.Store(time.Now().UnixNano())
+			mycli.startSessionWatchdog()
 		}
 	case *events.PairSuccess:
 		doWebhook = true
@@ -1153,7 +1186,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			"stage": "error",
 		}
 	case *events.StreamReplaced:
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received StreamReplaced event", mycli.userID)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] StreamReplaced — another client took this session, recovering", mycli.userID)
+		doWebhook = true
+		postMap["event"] = "StreamReplaced"
+		go mycli.forceSessionRecovery("stream_replaced")
+	case *events.KeepAliveTimeout:
+		mycli.markKeepAliveFailing(true)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+			"[%s] KeepAliveTimeout errorCount=%d lastSuccess=%s",
+			mycli.userID, evt.ErrorCount, evt.LastSuccess.Format(time.RFC3339),
+		)
+		if evt.ErrorCount >= 3 || time.Since(evt.LastSuccess) >= keepAliveFailReconnectAfter {
+			go mycli.forceSessionRecovery("keepalive_timeout")
+		}
+		return
+	case *events.KeepAliveRestored:
+		mycli.markKeepAliveFailing(false)
+		mycli.service.MarkSessionHealthy(mycli.userID)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] KeepAliveRestored — session health recovered", mycli.userID)
 		return
 	case *events.TemporaryBan:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] User received temporary ban for %s", mycli.userID, evt.Code.String())
@@ -1203,6 +1253,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE RECEIVED ===== ID: %s, From: %s, Type: %s, Size: %s", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, messageSize)
+		mycli.service.MarkSessionHealthy(mycli.userID)
 
 		// se readMessages for true ele marca como lida
 		if mycli.Instance.ReadMessages {
@@ -1890,6 +1941,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "LoggedOut"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Logged out for reason %s", mycli.userID, evt.Reason.String())
 
+		mycli.stopSessionWatchdog()
+		mycli.markKeepAliveFailing(false)
+
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
@@ -2022,6 +2076,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Disconnected:
 		doWebhook = true
 		postMap["event"] = "Disconnected"
+
+		mycli.stopSessionWatchdog()
+		mycli.markKeepAliveFailing(false)
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
@@ -2275,7 +2332,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced", "SessionUnhealthy", "KeepAliveTimeout", "KeepAliveRestored":
 		if contains(subscriptions, "CONNECTION") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2563,7 +2620,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
-			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced", "SessionUnhealthy", "KeepAliveTimeout", "KeepAliveRestored":
 				globalEventType = "CONNECTION"
 			case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 				globalEventType = "LABEL"
@@ -2625,7 +2682,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"
-		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced", "SessionUnhealthy", "KeepAliveTimeout", "KeepAliveRestored":
 			globalEventType = "CONNECTION"
 		case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 			globalEventType = "LABEL"
@@ -2885,6 +2942,7 @@ func NewWhatsmeowService(
 		natsProducer:       natsProducer,
 		loggerWrapper:      loggerWrapper,
 		passkeyCeremony:    ceremony.NewStore(),
+		sessionRecovery:    newSessionRecoveryTracker(),
 	}
 }
 
