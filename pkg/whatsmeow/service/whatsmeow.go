@@ -144,6 +144,7 @@ type MyClient struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
+	qrGeneration       atomic.Uint64
 	passkeyCeremony    *ceremony.Store
 
 	// Session health (zombie / half-open WebSocket detection)
@@ -427,6 +428,19 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] No store found. Creating new one", cd.Instance.Id)
 		deviceStore = container.NewDevice()
 
+		// Stale JID in DB without matching auth store causes endless QR churn
+		// (lookup fails → new device → still keeps old jid → kill/restart loop).
+		if cd.Instance.Jid != "" {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn(
+				"[%s] Clearing stale JID %s (device store missing)",
+				cd.Instance.Id, cd.Instance.Jid,
+			)
+			cd.Instance.Jid = ""
+			if err := w.instanceRepository.UpdateJid(cd.Instance.Id, ""); err != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to clear stale jid: %v", cd.Instance.Id, err)
+			}
+		}
+
 		cd.Instance.Connected = false
 		err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
 		if err != nil {
@@ -667,9 +681,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
 			}
 
-			// ReconnectClient already restarts via StartInstance — only tear down here.
+			// ReconnectClient / QRTimeout own the lifecycle — only tear down here.
 			if mycli.skipKillRestart.Load() {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill signal handled without restart (reconnect in progress)", cd.Instance.Id)
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill signal handled without restart (reconnect or QR timeout)", cd.Instance.Id)
 				return
 			}
 
@@ -782,9 +796,18 @@ func processPresenceUpdates(mycli *MyClient) {
 // the rotation/self-timer are new. Runs in its own goroutine so it never blocks
 // the whatsmeow event dispatch.
 func (mycli *MyClient) handleQRCodes(codes []string) {
+	// Invalidate any previous QR rotator for this client (overlapping events.QR /
+	// StartClient restarts were stacking goroutines and blowing past max count).
+	gen := mycli.qrGeneration.Add(1)
+
 	go func() {
 		instanceID := mycli.userID
 		for i, code := range codes {
+			if mycli.qrGeneration.Load() != gen {
+				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR rotator superseded — stopping", instanceID)
+				return
+			}
+
 			// A successful pair (Store.ID set) or an in-flight passkey ceremony
 			// supersedes QR — stop rotating WITHOUT tearing down. Store.ID stays
 			// nil throughout a passkey ceremony (it is only set at PairSuccess),
@@ -866,6 +889,10 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 			time.Sleep(timeout)
 		}
 
+		if mycli.qrGeneration.Load() != gen {
+			return
+		}
+
 		// Ran out of codes without a PairSuccess. Treat as QR timeout (mirrors
 		// GetQRChannel's "timeout") — UNLESS a passkey ceremony is in flight, in
 		// which case the socket must stay alive for the ceremony to complete.
@@ -893,12 +920,30 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	instanceID := mycli.userID
 
+	// Stop every in-flight QR rotator and prevent kill-loop from auto-restarting
+	// into another pairing cycle (that was the QRTimeout → Restart → QR#5 loop).
+	mycli.qrGeneration.Add(1)
+	mycli.skipKillRestart.Store(true)
+
 	if err := mycli.instanceRepository.UpdateQrcode(instanceID, ""); err != nil {
 		mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance: %s", instanceID, err)
 	}
 
+	// Clear stale JID so the next explicit /connect starts a clean new device.
+	if mycli.Instance != nil && mycli.Instance.Jid != "" {
+		mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Clearing JID after QR timeout: %s", instanceID, mycli.Instance.Jid)
+		mycli.Instance.Jid = ""
+		if err := mycli.instanceRepository.UpdateJid(instanceID, ""); err != nil {
+			mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Failed to clear jid after QR timeout: %v", instanceID, err)
+		}
+	}
+
 	if reason != "" {
 		if err := mycli.instanceRepository.UpdateConnected(instanceID, false, reason); err != nil {
+			mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance status: %v", instanceID, err)
+		}
+	} else {
+		if err := mycli.instanceRepository.UpdateConnected(instanceID, false, "QRTimeout"); err != nil {
 			mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance status: %v", instanceID, err)
 		}
 	}
@@ -909,6 +954,10 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 		data["qrcount"] = mycli.qrcodeCount
 		data["maxCount"] = mycli.config.QrcodeMaxCount
 		data["forceLogout"] = forceLogout
+	} else {
+		data["reason"] = "QR codes exhausted"
+		data["qrcount"] = mycli.qrcodeCount
+		data["maxCount"] = mycli.config.QrcodeMaxCount
 	}
 	postMap := map[string]interface{}{
 		"event":         "QRTimeout",
@@ -928,9 +977,13 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	// Signal StartClient's select loop to disconnect and clean up the shared
 	// maps (it is the single writer for this instance). Blocking send mirrors
 	// the original timeout branch so the signal is never dropped.
-	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
+	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel (no auto-restart)", instanceID)
 	if killChan, exists := mycli.killChannel[instanceID]; exists {
-		killChan <- true
+		select {
+		case killChan <- true:
+		default:
+			mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Kill channel full during QR timeout", instanceID)
+		}
 	}
 }
 
@@ -2091,13 +2144,23 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 
-		// Trigger instance restart via websocket-capable service (non-blocking)
-		go func(instanceID string) {
-			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Disconnected detected, restarting instance", instanceID)
-			if err := mycli.service.ReconnectClient(instanceID); err != nil {
-				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance: %v", instanceID, err)
-			}
-		}(mycli.userID)
+		// Trigger instance restart via websocket-capable service (non-blocking).
+		// Do NOT auto-reconnect while still pairing (no Store.ID): that restarts
+		// QR generation and was stacking with QRTimeout into an infinite loop.
+		if mycli.WAClient != nil && mycli.WAClient.IsLoggedIn() {
+			go func(instanceID string) {
+				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Disconnected detected, restarting instance", instanceID)
+				if err := mycli.service.ReconnectClient(instanceID); err != nil {
+					mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance: %v", instanceID, err)
+				}
+			}(mycli.userID)
+		} else {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+				"[%s] Disconnected during pairing — not auto-reconnecting (wait for explicit connect)",
+				mycli.userID,
+			)
+			mycli.skipKillRestart.Store(true)
+		}
 	case *events.LabelEdit:
 		doWebhook = true
 		postMap["event"] = "LabelEdit"
