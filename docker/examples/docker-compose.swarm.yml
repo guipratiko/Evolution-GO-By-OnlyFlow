@@ -6,6 +6,9 @@ services:
     networks:
       - network_public
     environment:
+      # Fuso horário (logs, schedules de presence, etc.)
+      TZ: America/Sao_Paulo
+
       # Servidor
       SERVER_PORT: 4000
       CLIENT_NAME: "evolution"
