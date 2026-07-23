@@ -73,6 +73,8 @@ type WhatsmeowService interface {
 	// Session health / zombie recovery
 	SessionRecovery() *sessionRecoveryTracker
 	MarkSessionHealthy(instanceId string)
+	// NotifyOutboundSend arms flush-after-send detection (half-open inbound backlog).
+	NotifyOutboundSend(instanceId string)
 }
 
 type clientVersion struct {
@@ -148,14 +150,20 @@ type MyClient struct {
 	passkeyCeremony    *ceremony.Store
 
 	// Session health (zombie / half-open WebSocket detection)
-	lastEventAt        atomic.Int64
-	keepAliveFailing   atomic.Bool
-	keepAliveFailSince atomic.Int64
-	connectedSince     atomic.Int64
-	watchdogStarted    atomic.Bool
-	watchdogStop       chan struct{}
-	watchdogStopOnce   sync.Once
-	skipKillRestart    atomic.Bool
+	lastEventAt             atomic.Int64
+	lastInboundMessageAt    atomic.Int64
+	keepAliveFailing        atomic.Bool
+	keepAliveFailSince      atomic.Int64
+	connectedSince          atomic.Int64
+	outboundWatchUntil      atomic.Int64
+	silenceBeforeOutbound   atomic.Int64
+	flushBurstCount         atomic.Int32
+	flushStaleCount         atomic.Int32
+	flushReconnectScheduled atomic.Bool
+	watchdogStarted         atomic.Bool
+	watchdogStop            chan struct{}
+	watchdogStopOnce        sync.Once
+	skipKillRestart         atomic.Bool
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -1306,6 +1314,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE RECEIVED ===== ID: %s, From: %s, Type: %s, Size: %s", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, messageSize)
+		mycli.noteInboundMessage(evt)
 		mycli.service.MarkSessionHealthy(mycli.userID)
 
 		// se readMessages for true ele marca como lida

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 const (
@@ -21,6 +22,14 @@ const (
 	// Some companion sessions go half-open around ~24h without a clean Disconnected.
 	// Refresh before that window to reduce zombie inbound stalls.
 	sessionMaxUptime = 18 * time.Hour
+
+	// Half-open pattern: inbound Message stalls, then a send wakes WA and a backlog flushes.
+	// Arm watch only if we already saw inbound traffic this session and it went quiet.
+	inboundSilenceArmWatch = 10 * time.Minute
+	flushWatchWindow       = 20 * time.Second
+	flushBurstMinCount     = 3
+	flushStaleMinCount     = 2
+	flushStaleMessageAge   = 2 * time.Minute
 )
 
 // sessionRecoveryTracker keeps recovery progress across ReconnectClient cycles
@@ -215,6 +224,10 @@ func (mycli *MyClient) probeSessionLiveness() error {
 }
 
 func (mycli *MyClient) preventiveSessionRefresh() {
+	mycli.preventiveSessionRefreshWithReason("session_ttl")
+}
+
+func (mycli *MyClient) preventiveSessionRefreshWithReason(reason string) {
 	if mycli == nil || mycli.service == nil {
 		return
 	}
@@ -230,19 +243,139 @@ func (mycli *MyClient) preventiveSessionRefresh() {
 	defer tracker.end(mycli.userID)
 
 	mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
-		"[%s] ===== SESSION PREVENTIVE REFRESH ===== uptime limit reached",
-		mycli.userID,
+		"[%s] ===== SESSION PREVENTIVE REFRESH ===== reason=%s",
+		mycli.userID, reason,
 	)
 	mycli.emitConnectionEvent("SessionUnhealthy", map[string]interface{}{
-		"reason": "session_ttl",
+		"reason": reason,
 		"action": "reconnect",
 	})
 
 	if err := mycli.service.ReconnectClient(mycli.userID); err != nil {
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogError(
-			"[%s] Preventive session refresh failed: %v", mycli.userID, err,
+			"[%s] Preventive session refresh failed (reason=%s): %v", mycli.userID, reason, err,
 		)
 	}
+}
+
+func (mycli *MyClient) touchLastInboundMessage() {
+	if mycli == nil {
+		return
+	}
+	mycli.lastInboundMessageAt.Store(time.Now().UnixNano())
+}
+
+// noteInboundMessage tracks inbound Message health and half-open flush-after-send bursts.
+func (mycli *MyClient) noteInboundMessage(evt *events.Message) {
+	if mycli == nil || evt == nil {
+		return
+	}
+
+	mycli.touchLastInboundMessage()
+
+	// Own echoes prove the pipe is alive but are expected after send — don't count as backlog.
+	if evt.Info.IsFromMe {
+		return
+	}
+
+	watchUntil := mycli.outboundWatchUntil.Load()
+	if watchUntil == 0 || time.Now().UnixNano() > watchUntil {
+		return
+	}
+
+	burst := mycli.flushBurstCount.Add(1)
+	stale := mycli.flushStaleCount.Load()
+	if !evt.Info.Timestamp.IsZero() && time.Since(evt.Info.Timestamp) >= flushStaleMessageAge {
+		stale = mycli.flushStaleCount.Add(1)
+	}
+
+	mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+		"[%s] Possible inbound flush after send — burst=%d stale=%d msgAge=%s id=%s from=%s",
+		mycli.userID, burst, stale, time.Since(evt.Info.Timestamp).Round(time.Second),
+		evt.Info.ID, evt.Info.Chat.String(),
+	)
+}
+
+// armOutboundFlushWatch starts a short window to detect backlog flush after an OnlyFlow send.
+func (mycli *MyClient) armOutboundFlushWatch() {
+	if mycli == nil {
+		return
+	}
+
+	lastInbound := mycli.lastInboundMessageAt.Load()
+	if lastInbound == 0 {
+		// No Message seen this session — avoid false positives on quiet/new connections.
+		return
+	}
+
+	silence := time.Since(time.Unix(0, lastInbound))
+	if silence < inboundSilenceArmWatch {
+		return
+	}
+
+	mycli.outboundWatchUntil.Store(time.Now().Add(flushWatchWindow).UnixNano())
+	mycli.silenceBeforeOutbound.Store(int64(silence))
+	mycli.flushBurstCount.Store(0)
+	mycli.flushStaleCount.Store(0)
+	mycli.flushReconnectScheduled.Store(false)
+
+	mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+		"[%s] Armed outbound flush watch — inbound silence %s (window %s)",
+		mycli.userID, silence.Round(time.Second), flushWatchWindow,
+	)
+
+	go func() {
+		timer := time.NewTimer(flushWatchWindow + 500*time.Millisecond)
+		defer timer.Stop()
+		<-timer.C
+		mycli.evaluateOutboundFlushWatch()
+	}()
+}
+
+func (mycli *MyClient) evaluateOutboundFlushWatch() {
+	if mycli == nil {
+		return
+	}
+
+	burst := mycli.flushBurstCount.Load()
+	stale := mycli.flushStaleCount.Load()
+	silenceNs := mycli.silenceBeforeOutbound.Load()
+	mycli.outboundWatchUntil.Store(0)
+
+	triggered := stale >= flushStaleMinCount ||
+		(burst >= flushBurstMinCount && stale >= 1)
+
+	if !triggered {
+		if burst > 0 {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo(
+				"[%s] Outbound flush watch ended — burst=%d stale=%d (below threshold)",
+				mycli.userID, burst, stale,
+			)
+		}
+		return
+	}
+
+	if !mycli.flushReconnectScheduled.CompareAndSwap(false, true) {
+		return
+	}
+
+	mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+		"[%s] Inbound backlog flush detected after send (silence=%s burst=%d stale=%d) — soft reconnect",
+		mycli.userID, time.Duration(silenceNs).Round(time.Second), burst, stale,
+	)
+	go mycli.preventiveSessionRefreshWithReason("inbound_flush_after_send")
+}
+
+// NotifyOutboundSend arms flush-after-send detection for half-open sessions.
+func (w *whatsmeowService) NotifyOutboundSend(instanceID string) {
+	if w == nil || instanceID == "" {
+		return
+	}
+	mycli, ok := w.myClientPointer[instanceID]
+	if !ok || mycli == nil {
+		return
+	}
+	mycli.armOutboundFlushWatch()
 }
 
 func (mycli *MyClient) forceSessionRecovery(reason string) {
