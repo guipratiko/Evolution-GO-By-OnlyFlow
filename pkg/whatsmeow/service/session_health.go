@@ -17,19 +17,19 @@ const (
 	keepAliveFailReconnectAfter = 2 * time.Minute
 	sessionProbeInterval        = 2 * time.Minute
 	sessionProbeTimeout         = 20 * time.Second
-	maxRecoveryAttempts         = 3
+	maxRecoveryAttempts         = 2
 	recoveryAttemptResetAfter   = 30 * time.Minute
-	// Some companion sessions go half-open around ~24h without a clean Disconnected.
+	// Some companion sessions go half-open around ~15–24h without a clean Disconnected.
 	// Refresh before that window to reduce zombie inbound stalls.
-	sessionMaxUptime = 18 * time.Hour
+	sessionMaxUptime = 12 * time.Hour
 
 	// Half-open pattern: inbound Message stalls, then a send wakes WA and a backlog flushes.
 	// Arm watch only if we already saw inbound traffic this session and it went quiet.
-	inboundSilenceArmWatch = 10 * time.Minute
-	flushWatchWindow       = 20 * time.Second
-	flushBurstMinCount     = 3
-	flushStaleMinCount     = 2
-	flushStaleMessageAge   = 2 * time.Minute
+	inboundSilenceArmWatch = 8 * time.Minute
+	flushWatchWindow       = 25 * time.Second
+	flushBurstMinCount     = 2
+	flushStaleMinCount     = 1
+	flushStaleMessageAge   = 90 * time.Second
 )
 
 // sessionRecoveryTracker keeps recovery progress across ReconnectClient cycles
@@ -360,10 +360,12 @@ func (mycli *MyClient) evaluateOutboundFlushWatch() {
 	}
 
 	mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
-		"[%s] Inbound backlog flush detected after send (silence=%s burst=%d stale=%d) — soft reconnect",
+		"[%s] Inbound backlog flush detected after send (silence=%s burst=%d stale=%d) — forcing recovery (reconnect may not heal this companion)",
 		mycli.userID, time.Duration(silenceNs).Round(time.Second), burst, stale,
 	)
-	go mycli.preventiveSessionRefreshWithReason("inbound_flush_after_send")
+	// Soft reconnect is not enough for some companion sessions (e.g. persistent DDD-34 zombies);
+	// count toward escalation so repeated flushes end in logout + re-pair.
+	go mycli.forceSessionRecovery("inbound_flush_after_send")
 }
 
 // NotifyOutboundSend arms flush-after-send detection for half-open sessions.
