@@ -1176,8 +1176,26 @@ func (mycli *MyClient) processEvent(rawEvt interface{}) {
 			"stage": "error",
 		}
 	case *events.StreamReplaced:
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received StreamReplaced event", mycli.userID)
-		return
+		// WhatsApp closed this websocket because another session took the same device
+		// stream. Without reconnect, the instance can stay "connected" in DB but stop
+		// receiving inbound events (send may still work briefly / via stale client).
+		doWebhook = true
+		postMap["event"] = "StreamReplaced"
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] StreamReplaced — session superseded; reconnecting", mycli.userID)
+
+		mycli.userInfoCache.Delete(mycli.Instance.Token)
+		mycli.Instance.DisconnectReason = "StreamReplaced: websocket superseded by another connection"
+		mycli.Instance.Connected = false
+		if err := mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, mycli.Instance.Connected, mycli.Instance.DisconnectReason); err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance after StreamReplaced: %s", mycli.Instance.Id, err)
+		}
+
+		go func(instanceID string) {
+			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] StreamReplaced detected, restarting instance", instanceID)
+			if err := mycli.service.ReconnectClient(instanceID); err != nil {
+				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart after StreamReplaced: %v", instanceID, err)
+			}
+		}(mycli.userID)
 	case *events.TemporaryBan:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] User received temporary ban for %s", mycli.userID, evt.Code.String())
 		doWebhook = true
@@ -2310,7 +2328,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
 		if contains(subscriptions, "CONNECTION") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2598,7 +2616,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
-			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
 				globalEventType = "CONNECTION"
 			case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 				globalEventType = "LABEL"
@@ -2660,7 +2678,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"
-		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
 			globalEventType = "CONNECTION"
 		case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 			globalEventType = "LABEL"
