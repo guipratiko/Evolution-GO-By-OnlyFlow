@@ -1315,7 +1315,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE RECEIVED ===== ID: %s, From: %s, Type: %s, Size: %s", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, messageSize)
 		mycli.noteInboundMessage(evt)
-		mycli.service.MarkSessionHealthy(mycli.userID)
+		if !evt.Info.IsFromMe {
+			mycli.service.MarkSessionHealthy(mycli.userID)
+		}
 
 		// se readMessages for true ele marca como lida
 		if mycli.Instance.ReadMessages {
