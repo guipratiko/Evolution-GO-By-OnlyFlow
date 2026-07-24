@@ -108,6 +108,9 @@ type authStoreHolder struct {
 	err       error
 }
 
+// Debounce StreamReplaced→ReconnectClient to avoid reconnect loops during restart/catch-up.
+var streamReplacedReconnectAt sync.Map // instanceID -> time.Time
+
 type MyClient struct {
 	service            WhatsmeowService
 	WAClient           *whatsmeow.Client
@@ -1191,6 +1194,19 @@ func (mycli *MyClient) processEvent(rawEvt interface{}) {
 		}
 
 		go func(instanceID string) {
+			for {
+				if v, ok := streamReplacedReconnectAt.Load(instanceID); ok {
+					elapsed := time.Since(v.(time.Time))
+					if elapsed < 15*time.Second {
+						wait := 15*time.Second - elapsed
+						mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] StreamReplaced reconnect delayed %v (debounce)", instanceID, wait.Round(time.Millisecond))
+						time.Sleep(wait)
+						continue
+					}
+				}
+				streamReplacedReconnectAt.Store(instanceID, time.Now())
+				break
+			}
 			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] StreamReplaced detected, restarting instance", instanceID)
 			if err := mycli.service.ReconnectClient(instanceID); err != nil {
 				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart after StreamReplaced: %v", instanceID, err)

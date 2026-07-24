@@ -2,6 +2,7 @@ package message_service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -70,7 +71,88 @@ type MarkPlayedStruct struct {
 }
 
 type DownloadMediaStruct struct {
-	Message *waE2E.Message `json:"message"`
+	// Raw webhook/API payload. Accepts either a bare waE2E.Message or a wrapped
+	// {Info, Message} / {message:{...}} envelope (Backend sends webhook shapes).
+	Message json.RawMessage `json:"message"`
+}
+
+func messageHasDownloadableMedia(msg *waE2E.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.GetImageMessage() != nil || msg.GetAudioMessage() != nil ||
+		msg.GetDocumentMessage() != nil || msg.GetVideoMessage() != nil ||
+		msg.GetStickerMessage() != nil {
+		return true
+	}
+	if child := msg.GetAssociatedChildMessage(); child != nil && child.GetMessage() != nil {
+		return messageHasDownloadableMedia(child.GetMessage())
+	}
+	return false
+}
+
+func extractDownloadableMessage(raw json.RawMessage) (*waE2E.Message, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, errors.New("missing message payload")
+	}
+
+	tryUnmarshal := func(b []byte) *waE2E.Message {
+		var msg waE2E.Message
+		if err := json.Unmarshal(b, &msg); err != nil {
+			return nil
+		}
+		if messageHasDownloadableMedia(&msg) {
+			return &msg
+		}
+		return nil
+	}
+
+	if msg := tryUnmarshal(raw); msg != nil {
+		return msg, nil
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, errors.New("invalid media type")
+	}
+
+	for _, key := range []string{"Message", "message"} {
+		if inner, ok := envelope[key]; ok {
+			if msg := tryUnmarshal(inner); msg != nil {
+				return msg, nil
+			}
+			// Nested webhook data: { Message: { imageMessage: ... } } already tried;
+			// also handle { data: { Message: ... } } one level deeper via data key.
+			var nested map[string]json.RawMessage
+			if err := json.Unmarshal(inner, &nested); err == nil {
+				for _, nk := range []string{"Message", "message"} {
+					if deeper, ok := nested[nk]; ok {
+						if msg := tryUnmarshal(deeper); msg != nil {
+							return msg, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if dataRaw, ok := envelope["data"]; ok {
+		if msg := tryUnmarshal(dataRaw); msg != nil {
+			return msg, nil
+		}
+		var dataEnv map[string]json.RawMessage
+		if err := json.Unmarshal(dataRaw, &dataEnv); err == nil {
+			for _, key := range []string{"Message", "message"} {
+				if inner, ok := dataEnv[key]; ok {
+					if msg := tryUnmarshal(inner); msg != nil {
+						return msg, nil
+					}
+				}
+			}
+		}
+	}
+
+	return nil, errors.New("invalid media type")
 }
 
 type MessageStatusStruct struct {
@@ -368,7 +450,10 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 
 	var ts time.Time
 
-	msg := data.Message
+	msg, err := extractDownloadableMessage(data.Message)
+	if err != nil {
+		return nil, "", err
+	}
 
 	mimetype := ""
 	var mediaData []byte
@@ -378,6 +463,17 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	document := msg.GetDocumentMessage()
 	video := msg.GetVideoMessage()
 	sticker := msg.GetStickerMessage()
+
+	if img == nil && audio == nil && document == nil && video == nil && sticker == nil {
+		if child := msg.GetAssociatedChildMessage(); child != nil && child.GetMessage() != nil {
+			childMsg := child.GetMessage()
+			img = childMsg.GetImageMessage()
+			audio = childMsg.GetAudioMessage()
+			document = childMsg.GetDocumentMessage()
+			video = childMsg.GetVideoMessage()
+			sticker = childMsg.GetStickerMessage()
+		}
+	}
 
 	if img == nil && audio == nil && document == nil && video == nil && sticker == nil {
 		return nil, "", errors.New("invalid media type")
