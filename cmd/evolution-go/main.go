@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -342,6 +343,26 @@ func main() {
 	cfg := config.Load()
 
 	logger.LogInfo("Starting Evolution GO version %s", version)
+
+	// Optional pprof debug server. Enabled only when PPROF_PORT is set.
+	// Use it to capture goroutine stacks when an instance freezes (stops
+	// emitting events while staying connected):
+	//   curl "http://<host>:<PPROF_PORT>/debug/pprof/goroutine?debug=2"
+	// The dump shows exactly where a stuck handler goroutine is parked.
+	if pprofPort := os.Getenv("PPROF_PORT"); pprofPort != "" {
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		go func() {
+			logger.LogInfo("pprof debug server listening on :%s", pprofPort)
+			if err := http.ListenAndServe(":"+pprofPort, pprofMux); err != nil {
+				logger.LogError("pprof server error: %v", err)
+			}
+		}()
+	}
 
 	startTime := time.Now()
 

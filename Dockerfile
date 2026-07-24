@@ -20,10 +20,7 @@ RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION}" -o server ./cmd
 FROM alpine:3.19.1 AS final
 
 # poppler-utils provides pdftoppm, used to rasterize PDF page 1 for /send/media document thumbnails
-# tzdata + /etc/localtime: evita logs/horários em UTC quando o runtime só herda ENV TZ
-RUN apk update && apk add --no-cache tzdata ffmpeg libjpeg-turbo libwebp poppler-utils \
-	&& cp /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime \
-	&& echo "America/Sao_Paulo" > /etc/timezone
+RUN apk update && apk add --no-cache tzdata ffmpeg libjpeg-turbo libwebp poppler-utils
 
 WORKDIR /app
 

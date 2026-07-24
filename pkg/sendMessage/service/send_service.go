@@ -2777,7 +2777,6 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 	}
 
 	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Message sent successfully! ServerID: %d", instance.Id, response.ServerID)
-	s.whatsmeowService.NotifyOutboundSend(instance.Id)
 
 	messageInfo := types.MessageInfo{
 		MessageSource: types.MessageSource{
